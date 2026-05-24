@@ -1572,26 +1572,57 @@ function limpiarResultado() { document.getElementById('resultado').style.display
 function shake(el) { el.style.animation='none'; setTimeout(()=>el.style.animation='shake .4s ease',10); }
 
 // ══════════════════════════════════════════════
-//  ALARMA 15 MINUTOS – solo comidas (no corrección)
+//  ALARMA 16 MINUTOS – solo comidas (no corrección)
+//  FIX iOS: visibilitychange + resume() + reschedule
 // ══════════════════════════════════════════════
-let alarmTimer     = null;   // setTimeout principal (15 min)
-let countdownTimer = null;   // setInterval para la cuenta regresiva
-let alarmEndTime   = null;   // timestamp cuando suena la alarma
-let audioCtx       = null;   // Web Audio context (se crea al primer cálculo)
+let alarmTimer     = null;
+let countdownTimer = null;
+let alarmEndTime   = null;
+let audioCtx       = null;
+let _alarmLabel    = null;   // guardado para recuperar tras suspensión iOS
 
 const ALARM_MS = 16 * 60 * 1000; // 16 minutos
 
+// ── Escuchar cuando el usuario vuelve a la app (pantalla enciende / tab activa) ──
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;        // se fue a background → nada que hacer
+  if (!alarmEndTime) return;          // no hay alarma activa → ignorar
+
+  // Siempre intentar reactivar AudioContext al volver
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+
+  const remaining = alarmEndTime - Date.now();
+
+  if (remaining <= 0) {
+    // El timer se perdió mientras iOS dormía → disparar ahora
+    clearTimeout(alarmTimer);
+    clearInterval(countdownTimer);
+    alarmTimer     = null;
+    countdownTimer = null;
+    document.getElementById('alarmCountdown').classList.remove('running');
+    fireAlarm(_alarmLabel || '');
+  } else {
+    // Reiniciar setTimeout con el tiempo real que falta
+    clearTimeout(alarmTimer);
+    alarmTimer = setTimeout(() => {
+      clearInterval(countdownTimer);
+      document.getElementById('alarmCountdown').classList.remove('running');
+      fireAlarm(_alarmLabel || '');
+    }, remaining);
+  }
+});
+
 function initAudio() {
-  // Crear AudioContext
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
 
-  // Decodificar MP3 como AudioBuffer usando fetch (más fiable en iOS que atob)
   if (!window._hawaiianBuffer && !window._hawaiianLoading) {
     window._hawaiianLoading = true;
-    const b64   = document.getElementById('hawaiianB64').textContent.trim();
+    const b64     = document.getElementById('hawaiianB64').textContent.trim();
     const dataURI = 'data:audio/mpeg;base64,' + b64;
     fetch(dataURI)
       .then(r => r.arrayBuffer())
@@ -1609,23 +1640,29 @@ function initAudio() {
 }
 
 function playAlarmSound() {
-  // Reproducir usando AudioBuffer decodificado (bypasea restricciones iOS)
-  if (audioCtx && window._hawaiianBuffer) {
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    const source = audioCtx.createBufferSource();
-    source.buffer = window._hawaiianBuffer;
-    source.connect(audioCtx.destination);
-    source.start(0);
-    return;
+  const doPlay = () => {
+    if (audioCtx && window._hawaiianBuffer) {
+      const source = audioCtx.createBufferSource();
+      source.buffer = window._hawaiianBuffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+      return;
+    }
+    // Fallback: elemento <audio>
+    const audio = document.getElementById('hawaiianAudio');
+    if (audio) {
+      audio.muted = false; audio.volume = 1.0; audio.currentTime = 0;
+      audio.play().catch(() => playFallbackChime());
+      return;
+    }
+    playFallbackChime();
+  };
+
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().then(doPlay);   // esperar a que iOS desbloquee el audio
+  } else {
+    doPlay();
   }
-  // Fallback: intentar con elemento <audio>
-  const audio = document.getElementById('hawaiianAudio');
-  if (audio) {
-    audio.muted = false; audio.volume = 1.0; audio.currentTime = 0;
-    audio.play().catch(() => playFallbackChime());
-    return;
-  }
-  playFallbackChime();
 }
 
 function playFallbackChime() {
@@ -1650,28 +1687,21 @@ function playFallbackChime() {
 }
 
 function startAlarm(momentoLabel) {
-  // Cancelar cualquier alarma anterior
   cancelAlarm(false);
-
-  // Inicializar audio (requiere contexto activo)
   initAudio();
 
+  _alarmLabel  = momentoLabel;         // guardar para recuperación tras suspensión
   alarmEndTime = Date.now() + ALARM_MS;
 
-  // Arrancar cuenta regresiva visible
   const countdown = document.getElementById('alarmCountdown');
   countdown.classList.add('running');
   updateCountdownDisplay();
 
   countdownTimer = setInterval(() => {
-    if (Date.now() >= alarmEndTime) {
-      clearInterval(countdownTimer);
-      return;
-    }
+    if (Date.now() >= alarmEndTime) { clearInterval(countdownTimer); return; }
     updateCountdownDisplay();
   }, 1000);
 
-  // Timer principal: disparar alarma a los 15 min
   alarmTimer = setTimeout(() => {
     clearInterval(countdownTimer);
     countdown.classList.remove('running');
@@ -1688,13 +1718,9 @@ function updateCountdownDisplay() {
 }
 
 function fireAlarm(momentoLabel) {
-  // Sonido
   playAlarmSound();
-
-  // Vibración háptica larga (móvil/tablet)
   if (navigator.vibrate) navigator.vibrate([300, 150, 300, 150, 600]);
 
-  // Mostrar toast
   const msg = {
     Desayuno: '¡El desayuno te espera! Ya puedes comer 🥞',
     Almuerzo: '¡Hora de almorzar! Ya puedes comer 🍱',
@@ -1704,8 +1730,6 @@ function fireAlarm(momentoLabel) {
 
   document.getElementById('alarmToastMsg').textContent = msg;
   document.getElementById('alarmToast').classList.add('show');
-
-  // Auto-cerrar el toast después de 12 segundos
   setTimeout(dismissToast, 12000);
 }
 
@@ -1717,6 +1741,7 @@ function cancelAlarm(hideCountdown = true) {
   if (alarmTimer)     { clearTimeout(alarmTimer);      alarmTimer     = null; }
   if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
   alarmEndTime = null;
+  _alarmLabel  = null;
   if (hideCountdown) {
     document.getElementById('alarmCountdown').classList.remove('running');
   }
